@@ -7,36 +7,94 @@ University of Newcastle
 """
 # Imports
 from __future__ import division, print_function
-from psychopy import visual, core, data, event, logging, gui, sound, parallel
+from psychopy import visual, core, data, event, logging, gui, sound
 import csv
 import os  # handy system and path functions
 import sys
-from itertools import izip, chain
-from collections import defaultdict
-import matplotlib.pyplot as plt
 import pandas as pd
+from numpy import linspace
 import ast
 
 
-def readSounds(soundfile):
+class SoundSpec(object):
+    def __init__(self):
+        self._sound = None
+        self.volume = 1.0
+        self._genVol = None
+
+    @property
+    def sound(self):
+        """return a sound if it exists, otherwise generate and return it"""
+        if self._sound and self.volume == self._genVol:
+            return self._sound
+        self._generate()
+        self._genVol = self.volume
+        return self._sound
+
+
+class SoundFromSpec(SoundSpec):
+    '''Holds a sound specification and returns a psychopy sound object when
+    queried'''
+    def __init__(self, specification=None):
+        """One and only one of filename or specification must be not None"""
+        super(SoundFromSpec, self).__init__()
+        self.freq = specification['Frequency']
+        self.dur = float(specification['Length'])
+        self.target = specification['Target']
+
+    def _generate(self):
+        self._sound = sound.Sound(value=self.freq, secs=self.dur,
+                                  volume=self.volume)
+
+    def __eq__(self, other):
+        if not isinstance(other, SoundFromSpec):
+            return NotImplemented
+        return (self.freq == other.freq and
+                self.dur == other.dur and
+                self.target == other.target)
+
+    def __hash__(self):
+        return hash((self.freq, self.dur, self.target))
+
+    def __str__(self):
+        return 'Freq:({0.freq}), Duration:({0.dur})'.format(self)
+
+
+class SoundFromFile(SoundSpec):
+    '''Holds a sound file and generates psychopy sound object as needed'''
+    def __init__(self, filename=None, target=None):
+        super(SoundFromFile, self).__init__()
+        self.filename = filename
+        self.target = target
+
+    def _generate(self):
+        self._sound = sound.Sound(value=self.filename, volume=self.volume)
+
+    def __eq__(self, other):
+        if not isinstance(other, SoundFromFile):
+            return NotImplemented
+        return (self.filename == other.filename and
+                self.target == other.target)
+
+    def __hash__(self):
+        return hash((self.filename, self.target))
+
+    def __str__(self):
+        return self.filename
+
+
+def loadSounds(soundfile):
     """Read and parse the sounds.csv file"""
     with open(soundfile) as soundfile:
         soundreader = csv.DictReader(soundfile)
         for row in soundreader:
-            row['PortCode'] = int(row['PortCode'])
+            length = row['Length']
+            if ';' in length:
+                row['Length'] = ast.literal_eval(length.replace(';', ','))
+            else:
+                row['Length'] = ast.literal_eval(length)
             row['Frequency'] = ast.literal_eval(row['Frequency'])
             yield row
-
-
-def graphCumulativePercent(*data):
-    """create plot of cumulative % correct, save to disk and return filename"""
-    with NamedTemporaryFile(delete=False, suffix='.png') as figfile:
-        for label, df in data:
-            df['CumPercent'].plot(label=label)
-        plt.legend()
-        plt.savefig(figfile)
-        plt.close()
-    return figfile.name
 
 
 class Calibration(object):
@@ -44,13 +102,28 @@ class Calibration(object):
     and creates resources like file descriptors and display adapters"""
     def __init__(self, name='Calibration'):
         """Setup the experiment, create windows and gather subject details"""
-        super(Experiment, self).__init__()
-        self.subject = {'Subject ID': ''}
+        super(Calibration, self).__init__()
         self.date = data.getDateStr()
         self.name = name
-        self.sounds = gui.fileOpenDlg(prompt=u'Select sound file specs to run')
+        file_filter = 'Sound specifications (*.csv);;Sound files (*.wav)'
+        self._inputhandling(gui.fileOpenDlg(allowed=file_filter))
         self._filehandling()
         self._hwsetup()
+
+    def _inputhandling(self, filelist):
+        """Handles the result of the file selection dialog"""
+        if not filelist:
+            self.cleanQuit()
+        self.genSounds = []
+        self.readSounds = {}
+        for f in filelist:
+            if f[-3:] == 'csv':
+                self.genSounds.extend(list(loadSounds(f)))
+            else:
+                self.readSounds[f] = ''
+        if self.readSounds:
+            gui.DlgFromDict(self.readSounds,
+                            title='Enter dB Target per file - CSV for > 1')
 
     def _filehandling(self):
         """Create file paths, setup logging, change working directories"""
@@ -59,15 +132,12 @@ class Calibration(object):
             sys.getfilesystemencoding())
         os.chdir(_thisDir)
         # Create base output filename
-        filestruct = '{{0.sounds}_{0.name}_{0.date}'.format(self)
+        filestruct = '{0.name}_{0.date}'.format(self)
         self.filename = os.path.join(_thisDir, 'data/'+filestruct)
         # save a log file for detail verbose info
         self.logFile = logging.LogFile(self.filename + '.log',
                                        level=logging.EXP)
         logging.console.setLevel(logging.WARNING)  # this outputs to the screen
-        # An ExperimentHandler isn't essential but helps with data saving
-        self.handler = data.ExperimentHandler(name=self.name,
-                                              dataFileName=self.filename)
 
     def _hwsetup(self):
         """Set up hardware like displays, sounds, etc"""
@@ -83,39 +153,45 @@ class Calibration(object):
         # Set up the sound card
         sound.init(rate=48000, stereo=True, buffer=256)
         self.volume = 0.4
-        # Create some handy timers
-        self.clock = core.Clock()  # to track the time since experiment started
-        # Create a parallel port handler
-        self.port = parallel.ParallelPort(address=0x0378)
 
     def buildStimuli(self):
         """Build individual stimuli for use in the experiment"""
-        self.stimuli = dict()
-
         # Initialize components for Routine "TDTInstructions"
         self.defaulttext = dict(font='Arial', height=0.1, alignHoriz='center')
 
-        self.soundlist = list(readSounds())
-        self.generated_sounds=dict()
+        self.sounds = []
+        for filename, target in self.readSounds.items():
+            self.sounds.append(SoundFromFile(filename=filename, target=target))
 
+        for spec in self.genSounds:
+            try:
+                self.sounds.append(SoundFromSpec(spec))
+            except TypeError:
+                for dur in linspace(*spec['Length']):
+                    newspec = spec.copy()
+                    newspec['Length'] = dur
+                    self.sounds.append(SoundFromSpec(newspec))
 
     def runInstructions(self):
         """Present the instructions"""
-        itext = '''
-        This task will present sounds to be measured. The keys
-        to use will be as follows:
-            ← - go to previous sound
-            → - go to next sound
-            ↓ - change volume down
-            ↑ - change volume up
-            i - change volume increment (0.1, 0.01, 0.001)
-            m - mark volume as correct
-            p - plot results
-            Escape - quits
+        itext = u'''
+        This task will present sounds to be measured.
+        The keys to use will be as follows:
+
+            ←\t\t\t- go to previous sound
+            →\t\t\t- go to next sound
+            ↓\t\t\t- change volume down
+            ↑\t\t\t- change volume up
+            i\t\t\t\t- change volume increment (0.1, 0.01, 0.001)
+            m\t\t\t- mark volume as correct
+            p\t\t\t- plot results
+            Escape\t- quits
+
         Press any key to continue
         '''
         instruction = visual.TextStim(win=self.win, name='InstrText',
                                       text=itext, **self.defaulttext)
+        instruction.wrapWidth += 0.7
         instruction.draw()
         self.win.flip()
         while True:
@@ -123,201 +199,111 @@ class Calibration(object):
             if theseKeys:
                 break
 
-    def getSound(self, freq, dur):
-        """return a pre-made sound, or generate and return"""
-        try:
-            return self.generated_sounds[(freq, dur)]
-        except KeyError:
-            newSound = sound.Sound(value=freq, secs=dur)
-            self.generated_sounds[(freq, dur)] = newSound
-            return newSound
+    def previous(self):
+        self.idx -= 1
+        if self.idx < 0:
+            self.idx = len(self.marked) - 1
 
-    def check_keys(self, sound=None)
+    def next(self):
+        self.idx += 1
+        if self.idx == len(self.marked):
+            self.idx = 0
+
+    def increase(self):
+        self.vol += self.inc
+        if self.vol > 1.0:
+            self.vol = 1.0
+
+    def decrease(self):
+        self.vol -= self.inc
+        if self.vol < 0.0:
+            self.vol = 0.0
+
+    def toggleinc(self):
+        toggle = {0.1: 0.01, 0.01: 0.001, 0.001: 0.1}
+        self.inc = toggle[self.inc]
+
+    def mark(self):
+        self.marked[self.current].append(self.vol)
+
+    def check_keys(self, sound=None):
         event.clearEvents()
-        repeatTimer = core.CountdownClock(1.5)
-        keymap = {'left':self.previous,
-                  'right':self.next,
-                  'up':self.increase,
-                  'down':self.decrease,
-                  'i':self.toggleinc,
-                  'm':self.mark,
-                  'p':self.plot,
-                  'escape'self.cleanQuit}
+        repeatTimer = core.CountdownTimer(1.5)
+        keymap = {'left': self.previous,
+                  'right': self.next,
+                  'up': self.increase,
+                  'down': self.decrease,
+                  'i': self.toggleinc,
+                  'm': self.mark,
+                  'escape': self.cleanQuit}
+        sound.play()
         while True:
-            if repeatTimer < 0:
-                sound.play()
-                repeatTimer.reset()
-            theseKeys = event.getKeys(keyList=keys)
+            theseKeys = event.getKeys(keyList=keymap.keys())
             if len(theseKeys) > 0:  # at least one key was pressed
                 # grab just the first key pressed
                 key = theseKeys[0]
-                # perform action
-                keymap[key]()
+                # return action
+                return keymap[key]
+            if repeatTimer.getTime() < 0:
+                sound.play()
+                repeatTimer.reset()
 
-    def getCurrentData(self):
-        """Grab all data to date from the ExperimentHandler"""
-        data = pd.DataFrame(self.handler.entries)
-        data.dropna(subset=['Description'], inplace=True)
-        data['Ones'] = 1
-        grouped_data = data.groupby('Length')
-        data['CumCorr'] = grouped_data['Correct'].cumsum()
-        data['CumCount'] = grouped_data['Ones'].cumsum()
-        data['CumPercent'] = data['CumCorr']/data['CumCount']
-        return grouped_data, data['Correct'].mean()
+    @property
+    def current(self):
+        """Return current sound"""
+        return self.sounds[self.idx]
 
-    def plot(self):
-        """Show feedback for the block"""
-        gdata, meanCorrect = self.getCurrentData()
-        fbtxt = 'Total Percent Correct so far is {}'.format(meanCorrect)
-        feedback = visual.TextStim(win=self.win, name='Feedback',
-                                   text=fbtxt, pos=(0.0, -0.5),
-                                   **self.defaulttext)
-        graphname = graphCumulativePercent(gdata)
-        fbgraph = visual.ImageStim(win=self.win, image=graphname,
-                                   pos=(0.0, 0.5), name='Graph')
-        feedback.draw()
-        fbgraph.draw()
-        self.win.flip()
-        self.handler.addData('Message', 'Feedback')
-        self.handler.addData('Timestamp', self.clock.getTime())
-        displayTimeClock = core.CountdownTimer(block['Feedback'])
-        while displayTimeClock.getTime() > 0:
-            theseKeys = event.getKeys()
-            if 'escape' in theseKeys:
-                self.cleanQuit()
+    def runCalibration(self):
+        '''Run through all sounds and check calibration'''
+        self.idx = 0
+        self.vol = 0.4
+        self.inc = 0.1
+        self.marked = {k: [] for k in self.sounds}
+        rtext = u'''
+        Calibration in progress
 
-    def doBreak(self, block):
-        """Show the break/countdown text"""
-        onesecondTimer = core.CountdownTimer(1)
-        if block['Break']:
-            breakTimer = core.CountdownTimer(block['Break'])
-            brtxt = ('5 MINUTE BREAK\n',
-                     'Feel free to have a stretch and wiggle.\n',
-                     'If you need anything, please ask the researcher.')
-            breakText = visual.TextStim(win=self.win, name='Feedback',
-                                        text=brtxt, **self.defaulttext)
-            breakText.draw()
-            self.win.flip()
-            while breakTimer.getTime() > 0:
-                theseKeys = event.getKeys()
-                if 'escape' in theseKeys:
-                    self.cleanQuit()
-        for n in reversed(xrange(block['Countdown'])):
-            countdownText = visual.TextStim(win=self.win, name='Countdown',
-                                            text=str(n+1), **self.defaulttext)
-            countdownText.draw()
-            self.win.flip()
-            onesecondTimer.reset()
-            while onesecondTimer.getTime() > 0:
-                theseKeys = event.getKeys()
-                if 'escape' in theseKeys:
-                    self.cleanQuit()
-
-    def runTask(self):
-        """Create a Quest staircase and run the tasks from blocks.csv"""
-        sd = self.stimuli['init_large_dur'] - self.stimuli['short_dur']
-        minVal = self.stimuli['short_dur']
-        maxVal = self.stimuli['init_large_dur'] + sd
-        staircase = data.QuestHandler(
-            self.stimuli['init_large_dur'], sd, pThreshold=0.75,
-            method='quantile', ntrials=800, minVal=minVal, maxVal=maxVal,
-            range=maxVal-minVal)
-        # add the loop to the experiment and initialise some vals
-        self.handler.addLoop(staircase)
-        # Draw our screen now
-        self.stimuli['fixation'].draw()
-        self.win.flip()
-        soaClock = core.CountdownTimer(self.soa)
-        keyClock = core.Clock()
-        short = self.stimuli['short_dur']
-        keymatch = {'long': {'left': 0, 'right': 1},
-                    'short': {'left': 1, 'right': 0}}
-
-        for block_cntr, block in enumerate(self.blocks, 1):
-            self.send_code(code=254)
-            for stimulus in block['Sequence']:
-                sndlength = stimulus['Length']
-                dur = staircase.next() if sndlength == 'long' else short
-                freq = stimulus['Frequency']
-                thisSound = self.getSound(freq, dur)
-                self.handler.addData('Block', block_cntr)
-                self.handler.addData('Duration', dur)
-                for key, val in stimulus.items():
-                    self.handler.addData(key, val)
-                thisSound.setVolume(self.stimuli['volume'])
-                while soaClock.getTime() > 0:
-                    timeleft = soaClock.getTime()
-                    if timeleft > 0.2:
-                        core.wait(timeleft-0.2, hogCPUperiod=0.2)
-
-                keyClock.reset()
-                soaClock.reset()  # clock
-                self.handler.addData('Timestamp', self.clock.getTime())
-                thisSound.play()
-                self.send_code(stimulus=stimulus)
-
-                # Check for a response
-                resp = self.check_keys(timer=keyClock,
-                                       keymap=keymatch[sndlength])
-                for key, val in resp.items():
-                    self.handler.addData(key, val)
-                if sndlength == 'long':
-                    staircase.addResponse(resp['Correct'])
-
-                self.handler.nextEntry()
-            self.send_code(code=255)
-            self.showFeedback(block)
-            self.doBreak(block)
-        # staircase completed
-        staircase.printAsText()
-
-    def runThanks(self):
-        """Present the Thank you screen"""
-        self.stimuli['thanksText'].draw()
-        self.win.flip()
-        starttime = self.clock.getTime()
+            Sound:\t\t\t{}
+            Target:\t\t\t{}
+            Marked:\t\t\t{}
+            Volume:\t\t\t{}
+            <Escape>\t- quits
+        '''
         while True:
-            theseKeys = event.getKeys()
-            if 'escape' in theseKeys:
-                self.cleanQuit()
-            elif theseKeys:
-                if self.clock.getTime() - starttime > 0.5:
-                    break
-        # store data for thisExp (ExperimentHandler)
-        self.handler.addData('Message', 'ThankYou')
-        self.handler.addData('Timestamp', self.clock.getTime())
-        self.handler.nextEntry()
+            # Display our current information
+            txt = rtext.format(self.current, self.current.target,
+                               bool(self.marked[self.current]), self.vol)
+            runText = visual.TextStim(win=self.win, name='RunText',
+                                      text=txt, **self.defaulttext)
+            runText.wrapWidth += 0.7
+            runText.draw()
+            self.win.flip()
+            # Check keys, play sounds and then perform resulting actions
+            self.current.volume = self.vol
+            action = self.check_keys(self.current.sound)
+            action()
 
     def cleanQuit(self):
         """Cleanly quit psychopy and run any internal cleanup"""
         # Finalising data writing etc
         # these shouldn't be strictly necessary (should auto-save)
-        self.handler.saveAsWideText(self.filename+'.csv')
-        self.handler.saveAsPickle(self.filename)
+        results = pd.DataFrame.from_dict(self.marked, orient='index')
+        results.to_csv(self.filename+'.csv')
         logging.flush()
         # make sure everything is closed down
-        self.handler.abort()  # or data files will save again on exit
         self.win.close()
         core.quit()
-        for tf in self.tempfiles:
-            os.remove(tf)
 
     def run(self, debug=False):
         """Run the whole experiment"""
         # Setup
         self.buildStimuli()
-        self.buildSequences()
-
-        if debug:
-            debugSequences(self)
 
         self.runInstructions()
-        self.runTask()
-        self.runThanks()
+        self.runCalibration()
 
         self.cleanQuit()
 
 
 if __name__ == '__main__':
-    exp = Experiment()
-    exp.run(debug=True)
+    exp = Calibration()
+    exp.run()

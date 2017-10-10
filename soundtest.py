@@ -9,8 +9,9 @@ University of Newcastle
 from __future__ import division, print_function
 from psychopy import prefs
 prefs.general['audioLib'] = ['sounddevice', 'pyo', 'pygame']  # noqa E402
-prefs.general['audiodevice'] = u'SB Audigy 2 ZS ASIO [B000]'  # noqa E402
-from psychopy import visual, core, data, event, logging, gui, sound
+prefs.general['audiodevice'] = u'SB Audigy 2 ZS Audio [B000]'  # noqa E402
+from psychopy import visual, core, data, event, logging, gui, sound, parallel
+from psychopy.constants import PLAYING
 import csv
 import os  # handy system and path functions
 import sys
@@ -18,20 +19,20 @@ import pandas as pd
 from numpy import linspace
 import ast
 
+volume = 0.2
+
 
 class SoundSpec(object):
     def __init__(self):
         self._sound = None
-        self.volume = 1.0
-        self._genVol = None
+        self.volume = volume
 
     @property
     def sound(self):
         """return a sound if it exists, otherwise generate and return it"""
-        if self._sound and self.volume == self._genVol:
+        if self._sound:
             return self._sound
         self._generate()
-        self._genVol = self.volume
         return self._sound
 
 
@@ -43,21 +44,21 @@ class SoundFromSpec(SoundSpec):
         super(SoundFromSpec, self).__init__()
         self.freq = specification['Frequency']
         self.dur = float(specification['Length'])
-        self.target = specification['Target']
+        self.repeats = int(specification['Repeats'])
 
     def _generate(self):
         self._sound = sound.Sound(value=self.freq, secs=self.dur,
-                                  volume=self.volume)
+                                  volume=volume)
 
     def __eq__(self, other):
         if not isinstance(other, SoundFromSpec):
             return NotImplemented
         return (self.freq == other.freq and
                 self.dur == other.dur and
-                self.target == other.target)
+                self.repeats == other.repeats)
 
     def __hash__(self):
-        return hash((self.freq, self.dur, self.target))
+        return hash((self.freq, self.dur, self.repeats))
 
     def __str__(self):
         return 'Freq:({0.freq}), Duration:({0.dur})'.format(self)
@@ -65,22 +66,22 @@ class SoundFromSpec(SoundSpec):
 
 class SoundFromFile(SoundSpec):
     '''Holds a sound file and generates psychopy sound object as needed'''
-    def __init__(self, filename=None, target=None):
+    def __init__(self, filename=None, repeats=None):
         super(SoundFromFile, self).__init__()
         self.filename = filename
-        self.target = target
+        self.repeats = int(repeats)
 
     def _generate(self):
-        self._sound = sound.Sound(value=self.filename, volume=self.volume)
+        self._sound = sound.Sound(value=self.filename, volume=volume)
 
     def __eq__(self, other):
         if not isinstance(other, SoundFromFile):
             return NotImplemented
         return (self.filename == other.filename and
-                self.target == other.target)
+                self.repeats == other.repeats)
 
     def __hash__(self):
-        return hash((self.filename, self.target))
+        return hash((self.filename, self.repeats))
 
     def __str__(self):
         return self.filename
@@ -100,12 +101,12 @@ def loadSounds(soundfile):
             yield row
 
 
-class Calibration(object):
+class SoundTest(object):
     """Holds all experiment details such as implementation, run data (date etc)
     and creates resources like file descriptors and display adapters"""
     def __init__(self, name='Calibration'):
         """Setup the experiment, create windows and gather subject details"""
-        super(Calibration, self).__init__()
+        super(SoundTest, self).__init__()
         self.date = data.getDateStr()
         self.name = name
         file_filter = 'Sound specifications (*.csv);;Sound files (*.wav)'
@@ -126,7 +127,7 @@ class Calibration(object):
                 self.readSounds[f] = ''
         if self.readSounds:
             gui.DlgFromDict(self.readSounds,
-                            title='Enter dB Target per file - CSV for > 1')
+                            title='Enter number of repeats per file - CSV for > 1')
 
     def _filehandling(self):
         """Create file paths, setup logging, change working directories"""
@@ -141,6 +142,9 @@ class Calibration(object):
         self.logFile = logging.LogFile(self.filename + '.log',
                                        level=logging.EXP)
         logging.console.setLevel(logging.WARNING)  # this outputs to the screen
+        # An ExperimentHandler isn't essential but helps with data saving
+        self.handler = data.ExperimentHandler(name=self.name,
+                                              dataFileName=self.filename)
 
     def _hwsetup(self):
         """Set up hardware like displays, sounds, etc"""
@@ -149,22 +153,34 @@ class Calibration(object):
                                  monitor='testMonitor', units='norm')
         # store frame rate of monitor if we can measure it successfully
         self.frameRate = self.win.getActualFrameRate()
+        # Create a parallel port handler
+        self.port = parallel.ParallelPort(address=0x0378)
+        self.clock = core.Clock()  # to track the time since experiment started
         if self.frameRate is not None:
             self.frameDur = 1.0/round(self.frameRate)
         else:
             self.frameDur = 1.0/60.0  # couldn't get a reliable measure/guess
         # Set up the sound card
         sound.init(rate=48000, stereo=True, buffer=256)
-        self.volume = 0.4
+
+    def send_code(self, code=1, duration=0.005, stimulus=None):
+        """Send a code and clear it after duration, use code from stimulus if
+        it exists"""
+        if stimulus:
+            self.port.setData(stimulus['PortCode'])
+        else:
+            self.port.setData(code)
+        core.wait(duration)
+        self.port.setData(0)
 
     def buildStimuli(self):
         """Build individual stimuli for use in the experiment"""
         # Initialize components for Routine "TDTInstructions"
-        self.defaulttext = dict(font='Arial', height=0.1, alignHoriz='center')
+        self.defaulttext = dict(font='Arial', height=0.05, alignHoriz='center')
 
         self.sounds = []
-        for filename, target in self.readSounds.items():
-            self.sounds.append(SoundFromFile(filename=filename, target=target))
+        for filename, repeats in self.readSounds.items():
+            self.sounds.append(SoundFromFile(filename=filename, repeats=repeats))
 
         for spec in self.genSounds:
             try:
@@ -179,17 +195,8 @@ class Calibration(object):
         """Present the instructions"""
         itext = u'''
         This task will present sounds to be measured.
-        The keys to use will be as follows:
-
-            ←\t\t- go to previous sound
-            →\t\t- go to next sound
-            ↓\t\t\t- change volume down
-            ↑\t\t\t- change volume up
-            i\t\t\t- change volume increment (0.1, 0.01, 0.001)
-            m\t\t- mark volume as correct
-            p\t\t\t- plot results
-            Escape\t- quits
-
+        It expects a special cable from parallel and sound output to another
+        PC's sound input to record pulses and outputted sound.
         Press any key to continue
         '''
         instruction = visual.TextStim(win=self.win, name='InstrText',
@@ -202,101 +209,37 @@ class Calibration(object):
             if theseKeys:
                 break
 
-    def previous(self):
-        self.idx -= 1
-        if self.idx < 0:
-            self.idx = len(self.marked) - 1
-
-    def next(self):
-        self.idx += 1
-        if self.idx == len(self.marked):
-            self.idx = 0
-
-    def increase(self):
-        self.vol += self.inc
-        if self.vol > 1.0:
-            self.vol = 1.0
-
-    def decrease(self):
-        self.vol -= self.inc
-        if self.vol < 0.0:
-            self.vol = 0.0
-
-    def toggleinc(self):
-        toggle = {0.1: 0.01, 0.01: 0.001, 0.001: 0.1}
-        self.inc = toggle[self.inc]
-
-    def mark(self):
-        self.marked[self.current].append(self.vol)
-
-    def check_keys(self, sound=None):
-        event.clearEvents()
-        repeatTimer = core.CountdownTimer(1.5)
-        keymap = {'left': self.previous,
-                  'right': self.next,
-                  'up': self.increase,
-                  'down': self.decrease,
-                  'i': self.toggleinc,
-                  'm': self.mark,
-                  'escape': self.cleanQuit}
-        sound.play()
-        while True:
-            theseKeys = event.getKeys(keyList=keymap.keys())
-            if len(theseKeys) > 0:  # at least one key was pressed
-                # grab just the first key pressed
-                key = theseKeys[0]
-                # return action
-                return keymap[key]
-            if repeatTimer.getTime() < 0:
-                sound.play()
-                repeatTimer.reset()
-
     @property
     def current(self):
         """Return current sound"""
         return self.sounds[self.idx]
 
-    def runCalibration(self):
-        '''Run through all sounds and check calibration'''
-        self.idx = 0
-        self.vol = 0.4
-        self.inc = 0.1
-        self.marked = {k: [] for k in self.sounds}
+    def runSoundtest(self):
+        '''Run through all sounds to check timing'''
         rtext = u'''
-        Calibration in progress
-
-            Sound:\t\t{}
-            Target:\t\t{}
-            Marked:\t\t{}
-            Volume:\t\t{}
-            
-        Keys:
-            <Esc> to quit
-            <Up>/<Down> for volume
-            <Left>/<Right> to choose sound
-            <i> for volume increment
-            <m> to associate volume with sound
+        Timing test in progress
         '''
-        while True:
-            # Display our current information
-            txt = rtext.format(self.current, self.current.target,
-                               bool(self.marked[self.current]), self.vol)
-            runText = visual.TextStim(win=self.win, name='RunText',
-                                      text=txt, **self.defaulttext)
-            runText.wrapWidth += 0.7
-            runText.draw()
-            self.win.flip()
-            # Check keys, play sounds and then perform resulting actions
-            self.current.volume = self.vol
-            action = self.check_keys(self.current.sound)
-            action()
+        runText = visual.TextStim(win=self.win, name='RunText',
+                                  text=rtext, **self.defaulttext)
+        runText.wrapWidth += 0.7
+        runText.draw()
+        self.win.flip()
+        for snd in self.sounds:
+            for rep in range(snd.repeats):
+                print(rep)
+                self.handler.addData('Snd', rep)
+                self.handler.addData('Timestamp', self.clock.getTime())
+                snd.sound.play()
+                self.send_code()
+                while (snd.sound.status == PLAYING):
+                    pass
+                core.wait(0.05)
+            print('Snd' + str(snd))
 
     def cleanQuit(self):
         """Cleanly quit psychopy and run any internal cleanup"""
         # Finalising data writing etc
         # these shouldn't be strictly necessary (should auto-save)
-        results = pd.DataFrame.from_dict(self.marked, orient='index')
-        results.to_csv(self.filename+'.csv')
         logging.flush()
         # make sure everything is closed down
         self.win.close()
@@ -308,11 +251,11 @@ class Calibration(object):
         self.buildStimuli()
 
         self.runInstructions()
-        self.runCalibration()
+        self.runSoundtest()
 
         self.cleanQuit()
 
 
 if __name__ == '__main__':
-    exp = Calibration()
+    exp = SoundTest()
     exp.run()

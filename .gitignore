@@ -2,3 +2,5 @@
 *.pyc
 data/
 *.csv
+*.wav
+*.dll
